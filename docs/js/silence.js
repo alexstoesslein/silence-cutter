@@ -1,23 +1,54 @@
 /**
  * Silence Detection via FFmpeg.wasm
  * Runs ffmpeg silencedetect filter entirely in the browser.
+ *
+ * Uses UMD build from unpkg with blob URLs to avoid cross-origin Worker issues
+ * on GitHub Pages. The UMD build exposes FFmpegWASM on globalThis.
  */
 
 let ffmpegInstance = null;
 let ffmpegLoaded = false;
 
 /**
- * Load FFmpeg.wasm (one-time, ~30MB download from CDN)
+ * Load FFmpeg.wasm (one-time, ~30MB download from CDN).
+ * All resources are converted to blob URLs so Workers run same-origin.
  */
 export async function loadFFmpeg(onProgress) {
     if (ffmpegLoaded && ffmpegInstance) return ffmpegInstance;
 
-    const { FFmpeg } = await import(
-        "https://esm.sh/@ffmpeg/ffmpeg@0.12.10"
+    // Step 1: Fetch the worker chunk and create a blob URL for it
+    const workerChunkResp = await fetch(
+        "https://unpkg.com/@ffmpeg/ffmpeg@0.12.10/dist/umd/814.ffmpeg.js"
     );
-    const { toBlobURL } = await import(
-        "https://esm.sh/@ffmpeg/util@0.12.1"
+    const workerChunkText = await workerChunkResp.text();
+    const workerChunkBlob = new Blob([workerChunkText], { type: "text/javascript" });
+    const workerChunkBlobURL = URL.createObjectURL(workerChunkBlob);
+
+    // Step 2: Fetch the main ffmpeg.js UMD bundle and patch the chunk URL
+    const mainResp = await fetch(
+        "https://unpkg.com/@ffmpeg/ffmpeg@0.12.10/dist/umd/ffmpeg.js"
     );
+    let mainText = await mainResp.text();
+
+    // The UMD bundle constructs worker URL via: new URL(e.p + e.u(814), e.b)
+    // where e.p is the public path and e.u(814) returns "814.ffmpeg.js"
+    // We need to patch it so the worker blob URL is used instead.
+    // We do this by injecting classWorkerURL at load time (see below).
+
+    // Load the UMD bundle
+    const mainBlob = new Blob([mainText], { type: "text/javascript" });
+    const mainBlobURL = URL.createObjectURL(mainBlob);
+
+    // Execute via script tag (UMD sets globalThis.FFmpegWASM)
+    await new Promise((resolve, reject) => {
+        const script = document.createElement("script");
+        script.src = mainBlobURL;
+        script.onload = () => { URL.revokeObjectURL(mainBlobURL); resolve(); };
+        script.onerror = reject;
+        document.head.appendChild(script);
+    });
+
+    const { FFmpeg } = globalThis.FFmpegWASM;
 
     ffmpegInstance = new FFmpeg();
 
@@ -25,20 +56,32 @@ export async function loadFFmpeg(onProgress) {
         if (onProgress) onProgress(Math.round(progress * 100));
     });
 
-    const baseURL = "https://unpkg.com/@ffmpeg/core@0.12.6/dist/esm";
+    // Step 3: Load core WASM files as blob URLs
+    const coreBase = "https://unpkg.com/@ffmpeg/core@0.12.6/dist/umd";
 
-    // All URLs must be blob URLs to avoid cross-origin Worker restrictions
+    const [coreURL, wasmURL] = await Promise.all([
+        fetchAsBlobURL(`${coreBase}/ffmpeg-core.js`, "text/javascript"),
+        fetchAsBlobURL(`${coreBase}/ffmpeg-core.wasm`, "application/wasm"),
+    ]);
+
     await ffmpegInstance.load({
-        coreURL: await toBlobURL(`${baseURL}/ffmpeg-core.js`, "text/javascript"),
-        wasmURL: await toBlobURL(`${baseURL}/ffmpeg-core.wasm`, "application/wasm"),
-        classWorkerURL: await toBlobURL(
-            "https://unpkg.com/@ffmpeg/ffmpeg@0.12.10/dist/esm/worker.js",
-            "text/javascript"
-        ),
+        coreURL,
+        wasmURL,
+        classWorkerURL: workerChunkBlobURL,
     });
 
     ffmpegLoaded = true;
     return ffmpegInstance;
+}
+
+/**
+ * Fetch a URL and return it as a blob URL (same-origin).
+ */
+async function fetchAsBlobURL(url, mimeType) {
+    const resp = await fetch(url);
+    const buf = await resp.arrayBuffer();
+    const blob = new Blob([buf], { type: mimeType });
+    return URL.createObjectURL(blob);
 }
 
 /**
@@ -57,7 +100,6 @@ export async function writeFile(name, file) {
 export async function detectSilence(inputName, noiseDb = -35, minSilence = 0.7, minSpeech = 0.3, padding = 0.05) {
     const ffmpeg = await loadFFmpeg();
 
-    // Collect log output (silencedetect writes to stderr/log)
     let logBuffer = "";
     const logHandler = ({ message }) => {
         logBuffer += message + "\n";
@@ -155,7 +197,6 @@ export async function extractSegmentWav(inputName, segment) {
     ]);
 
     const data = await ffmpeg.readFile(outName);
-    // Clean up
     try { await ffmpeg.deleteFile(outName); } catch (_) {}
 
     return new Blob([data.buffer], { type: "audio/wav" });
