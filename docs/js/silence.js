@@ -11,12 +11,16 @@ let ffmpegLoaded = false;
 
 /**
  * Load FFmpeg.wasm (one-time download from CDN).
- * All resources loaded in parallel as blob URLs to avoid cross-origin Worker issues.
  * onProgress(percent, label) is called with download progress.
  *
- * Strategy: Download all assets as blob URLs. The worker's importScripts() can load
- * blob URLs (same blob: origin). We patch the worker source to replace the CDN core
- * URL with our blob URL so importScripts succeeds.
+ * Strategy for GitHub Pages (no COOP/COEP headers, no SharedArrayBuffer):
+ * The 814.ffmpeg.js worker tries importScripts(coreURL) which fails cross-origin
+ * from a blob Worker. Neither blob URL redirects nor importScripts overrides work
+ * reliably. Instead, we build a completely self-contained worker blob:
+ *   1. Inline ffmpeg-core.js text directly in the worker
+ *   2. Explicitly assign self.createFFmpegCore after it executes
+ *   3. Make importScripts a no-op that THROWS (so the worker's catch block
+ *      sees createFFmpegCore already set and skips the import() fallback)
  */
 export async function loadFFmpeg(onProgress) {
     if (ffmpegLoaded && ffmpegInstance) return ffmpegInstance;
@@ -26,34 +30,76 @@ export async function loadFFmpeg(onProgress) {
 
     if (onProgress) onProgress(0, "Downloads starten...");
 
-    // Download everything in parallel: main lib text, worker text, core JS blob, WASM blob
-    const [mainText, workerText, coreBlobURL, wasmBlobURL] = await Promise.all([
+    // Download all four assets in parallel
+    const [mainText, workerText, coreText, wasmBlobURL] = await Promise.all([
         fetchAsText(`${ffmpegBase}/ffmpeg.js`),
         fetchAsText(`${ffmpegBase}/814.ffmpeg.js`),
-        fetchAsBlobURL(`${coreBase}/ffmpeg-core.js`, "text/javascript"),
+        fetchAsText(`${coreBase}/ffmpeg-core.js`),
         fetchAsBlobURL(`${coreBase}/ffmpeg-core.wasm`, "application/wasm"),
     ]);
 
     if (onProgress) onProgress(15, "FFmpeg initialisieren...");
 
-    // The 814.ffmpeg.js worker receives the coreURL via a postMessage and calls
-    // importScripts(coreURL). On GitHub Pages, coreURL points to unpkg CDN which
-    // fails cross-origin from a blob: Worker. Fix: override importScripts to
-    // redirect CDN URLs to our same-origin blob URLs.
-    const patchedWorkerCode = `
-// Override importScripts to redirect cross-origin ffmpeg-core to blob URL
-const _origImportScripts = self.importScripts.bind(self);
-self.importScripts = function(...args) {
-    const mapped = args.map(a => {
-        if (typeof a === 'string' && a.includes('ffmpeg-core') && !a.startsWith('blob:')) {
-            return ${JSON.stringify(coreBlobURL)};
-        }
-        return a;
-    });
-    return _origImportScripts(...mapped);
-};
+    // Build self-contained worker:
+    //
+    // The worker code (814.ffmpeg.js) does this to load the core:
+    //   try { importScripts(r) } catch {
+    //     self.createFFmpegCore = (await import(r)).default;
+    //     if (!self.createFFmpegCore) throw s;
+    //   }
+    //
+    // If importScripts succeeds (no throw), the worker expects
+    // self.createFFmpegCore to already be set as a side-effect.
+    //
+    // Strategy:
+    //   1. Inline ffmpeg-core.js which sets `var createFFmpegCore = ...`
+    //   2. Force UMD to use global var (not module.exports) by hiding module/exports
+    //   3. Explicitly copy to self.createFFmpegCore
+    //   4. Make importScripts a silent no-op (no throw!) so the worker
+    //      thinks importScripts succeeded and finds createFFmpegCore set
+    //
+    // But 814.ffmpeg.js is ALSO a UMD module that checks module/exports.
+    // We need to restore module/exports before it runs, otherwise IT breaks.
 
-// Original worker code
+    // The 814.ffmpeg.js UMD wrapper checks: typeof exports, typeof module
+    // ffmpeg-core.js UMD wrapper checks the same.
+    // In a Worker, neither exists, so both use the global var path. Good.
+    //
+    // But we need ffmpeg-core.js to run FIRST (setting var createFFmpegCore),
+    // then importScripts must be a no-op when 814.ffmpeg.js tries to load it.
+    //
+    // Key insight: `var createFFmpegCore` at top-level of the blob becomes
+    // a property of the Worker global scope (self.createFFmpegCore).
+    // We just need to make sure the UMD tail of ffmpeg-core.js doesn't
+    // route to module.exports. In a Worker there's no `module` or `exports`
+    // by default, so the UMD tail should hit the global assignment path.
+    //
+    // The actual UMD tail of ffmpeg-core.js:
+    //   if (typeof exports === 'object' && typeof module === 'object')
+    //     module.exports = createFFmpegCore;     ← won't match in Worker
+    //   else if (typeof define === 'function' && define['amd'])
+    //     define([], ...);                        ← won't match
+    //   else if (typeof exports === 'object')
+    //     exports["createFFmpegCore"] = ...;      ← won't match
+    //
+    // So in a clean Worker scope, `var createFFmpegCore` stays as the global.
+    //
+    // BUT: 814.ffmpeg.js is also UMD and its wrapper does:
+    //   "object"==typeof exports&&"object"==typeof module?module.exports=t()
+    // It wraps with (self, factory) and sets e.FFmpegWASM = t() at the end.
+    // The self.onmessage is set inside the factory. So this should work fine.
+
+    const patchedWorkerCode = `
+// === Inline ffmpeg-core.js (sets var createFFmpegCore on global scope) ===
+${coreText}
+
+// === Make importScripts a no-op (must NOT throw!) ===
+// When 814.ffmpeg.js does try{importScripts(r)}catch{...}, the no-op
+// returns undefined (no throw), so the worker skips the catch block
+// and proceeds expecting self.createFFmpegCore to exist — which it does.
+self.importScripts = function() {};
+
+// === Original 814.ffmpeg.js worker code ===
 ${workerText}
 `;
 
@@ -82,12 +128,11 @@ ${workerText}
         if (onProgress) onProgress(30 + Math.round(progress * 70), "WASM laden...");
     });
 
-    // coreURL: our blob URL (the worker's patched importScripts will use it)
-    // wasmURL: blob URL (ffmpeg-core.js fetches WASM relative to its location,
-    //          but since it's a blob, we provide the explicit wasmURL)
-    // classWorkerURL: our patched blob worker
+    // coreURL: CDN URL (used by createFFmpegCore to derive wasmURL path)
+    // wasmURL: blob URL (WASM binary, fetched by emscripten)
+    // classWorkerURL: our self-contained blob worker
     await ffmpegInstance.load({
-        coreURL: coreBlobURL,
+        coreURL: `${coreBase}/ffmpeg-core.js`,
         wasmURL: wasmBlobURL,
         classWorkerURL: workerBlobURL,
     });
