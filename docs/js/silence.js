@@ -27,9 +27,14 @@ export async function loadFFmpeg(onProgress) {
 
     const baseURL = "https://unpkg.com/@ffmpeg/core@0.12.6/dist/esm";
 
+    // All URLs must be blob URLs to avoid cross-origin Worker restrictions
     await ffmpegInstance.load({
         coreURL: await toBlobURL(`${baseURL}/ffmpeg-core.js`, "text/javascript"),
         wasmURL: await toBlobURL(`${baseURL}/ffmpeg-core.wasm`, "application/wasm"),
+        classWorkerURL: await toBlobURL(
+            "https://unpkg.com/@ffmpeg/ffmpeg@0.12.10/dist/esm/worker.js",
+            "text/javascript"
+        ),
     });
 
     ffmpegLoaded = true;
