@@ -22,33 +22,46 @@ export async function loadFFmpeg(onProgress) {
 
     if (onProgress) onProgress(0, "Downloads starten...");
 
-    // Download ALL files in parallel: main lib, worker, core JS, and core WASM
-    // Everything must become blob URLs because:
-    // - main lib + worker: cross-origin Worker restriction
-    // - core JS: worker calls importScripts() which fails cross-origin in blob workers
-    // - core WASM: referenced by core JS relative to its own URL
-    const [mainText, workerText, coreBlobURL, wasmBlobURL] = await Promise.all([
+    // Download main lib, worker source, and core JS source in parallel.
+    // The WASM binary is NOT pre-fetched – ffmpeg-core.js loads it itself
+    // when given its original CDN URL context.
+    const [mainText, workerText, coreText] = await Promise.all([
         fetchAsText(`${ffmpegBase}/ffmpeg.js`),
         fetchAsText(`${ffmpegBase}/814.ffmpeg.js`),
-        fetchAsBlobURL(`${coreBase}/ffmpeg-core.js`, "text/javascript", (p) => {
-            if (onProgress) onProgress(Math.round(p * 0.05), "ffmpeg-core.js");
-        }),
-        fetchAsBlobURL(`${coreBase}/ffmpeg-core.wasm`, "application/wasm", (p) => {
-            if (onProgress) onProgress(5 + Math.round(p * 0.45), "ffmpeg-core.wasm");
-        }),
+        fetchAsText(`${coreBase}/ffmpeg-core.js`),
     ]);
 
-    if (onProgress) onProgress(55, "FFmpeg initialisieren...");
+    if (onProgress) onProgress(15, "FFmpeg initialisieren...");
 
-    // Patch the worker: replace the hardcoded default coreURL with our blob URL
-    // The worker has: const e="https://unpkg.com/@ffmpeg/core@0.12.6/dist/umd/ffmpeg-core.js"
-    // We replace it so importScripts() gets our blob URL
-    const patchedWorker = workerText.replace(
-        'https://unpkg.com/@ffmpeg/core@0.12.6/dist/umd/ffmpeg-core.js',
-        coreBlobURL
-    );
+    // The core problem: the 814.ffmpeg.js worker tries importScripts(coreURL)
+    // which fails cross-origin in blob workers. We patch the worker source to
+    // replace importScripts with inline execution of the core code.
+    //
+    // The worker code does: try { importScripts(r) } catch { ... }
+    // After importScripts, self.createFFmpegCore is set by ffmpeg-core.js.
+    // We prepend the core code so createFFmpegCore already exists,
+    // and patch out the importScripts call.
+
+    // Patch worker: prepend core.js and make importScripts a no-op for the core URL
+    const patchedWorkerCode = `
+// Pre-load ffmpeg-core.js inline (avoids cross-origin importScripts)
+${coreText}
+
+// Override importScripts so the worker doesn't try to load core again
+const _origImportScripts = self.importScripts;
+self.importScripts = function(...args) {
+    // Skip if trying to load ffmpeg-core (already loaded above)
+    const isCore = args.some(a => typeof a === 'string' && (a.includes('ffmpeg-core') || a.startsWith('blob:')));
+    if (isCore) return;
+    return _origImportScripts.apply(self, args);
+};
+
+// Original worker code
+${workerText}
+`;
+
     const workerBlobURL = URL.createObjectURL(
-        new Blob([patchedWorker], { type: "text/javascript" })
+        new Blob([patchedWorkerCode], { type: "text/javascript" })
     );
 
     // Load main UMD bundle via script tag (sets globalThis.FFmpegWASM)
@@ -63,18 +76,21 @@ export async function loadFFmpeg(onProgress) {
         document.head.appendChild(script);
     });
 
+    if (onProgress) onProgress(20, "FFmpeg laden...");
+
     const { FFmpeg } = globalThis.FFmpegWASM;
     ffmpegInstance = new FFmpeg();
 
     ffmpegInstance.on("progress", ({ progress }) => {
-        if (onProgress) onProgress(60 + Math.round(progress * 40), "WASM initialisieren...");
+        if (onProgress) onProgress(30 + Math.round(progress * 70), "WASM laden...");
     });
 
-    if (onProgress) onProgress(58, "WASM-Core laden...");
-
+    // coreURL: real CDN URL (used by createFFmpegCore to derive wasmURL/workerURL)
+    // wasmURL: real CDN URL (fetched by emscripten module via HTTP)
+    // classWorkerURL: our patched blob worker
     await ffmpegInstance.load({
-        coreURL: coreBlobURL,
-        wasmURL: wasmBlobURL,
+        coreURL: `${coreBase}/ffmpeg-core.js`,
+        wasmURL: `${coreBase}/ffmpeg-core.wasm`,
         classWorkerURL: workerBlobURL,
     });
 
