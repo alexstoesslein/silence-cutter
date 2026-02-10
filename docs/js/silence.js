@@ -20,23 +20,18 @@ export async function loadFFmpeg(onProgress) {
     const coreBase = "https://unpkg.com/@ffmpeg/core@0.12.6/dist/umd";
     const ffmpegBase = "https://unpkg.com/@ffmpeg/ffmpeg@0.12.10/dist/umd";
 
-    // Download ALL resources in parallel (the big speedup)
     if (onProgress) onProgress(0, "Downloads starten...");
 
-    const [mainText, workerText, coreURL, wasmURL] = await Promise.all([
+    // Step 1: Download main library + worker in parallel
+    // Core JS + WASM stay as real URLs (worker loads them via importScripts)
+    const [mainText, workerText] = await Promise.all([
         fetchAsText(`${ffmpegBase}/ffmpeg.js`),
         fetchAsText(`${ffmpegBase}/814.ffmpeg.js`),
-        fetchAsBlobURL(`${coreBase}/ffmpeg-core.js`, "text/javascript", (p) => {
-            if (onProgress) onProgress(Math.round(p * 0.1), "ffmpeg-core.js");
-        }),
-        fetchAsBlobURL(`${coreBase}/ffmpeg-core.wasm`, "application/wasm", (p) => {
-            if (onProgress) onProgress(10 + Math.round(p * 0.8), "ffmpeg-core.wasm");
-        }),
     ]);
 
-    if (onProgress) onProgress(90, "FFmpeg initialisieren...");
+    if (onProgress) onProgress(10, "FFmpeg initialisieren...");
 
-    // Worker chunk as blob URL
+    // Worker must be blob URL (cross-origin Worker restriction)
     const workerBlobURL = URL.createObjectURL(
         new Blob([workerText], { type: "text/javascript" })
     );
@@ -57,12 +52,17 @@ export async function loadFFmpeg(onProgress) {
     ffmpegInstance = new FFmpeg();
 
     ffmpegInstance.on("progress", ({ progress }) => {
-        if (onProgress) onProgress(95 + Math.round(progress * 5), "Verarbeitung...");
+        if (onProgress) onProgress(50 + Math.round(progress * 50), "WASM laden...");
     });
 
+    if (onProgress) onProgress(20, "WASM-Core laden...");
+
+    // Step 2: Load ffmpeg with real CDN URLs for core (worker needs importScripts access)
+    // Only classWorkerURL is a blob URL. coreURL + wasmURL are plain CDN URLs
+    // because the worker calls importScripts(coreURL) which doesn't work with blob URLs.
     await ffmpegInstance.load({
-        coreURL,
-        wasmURL,
+        coreURL: `${coreBase}/ffmpeg-core.js`,
+        wasmURL: `${coreBase}/ffmpeg-core.wasm`,
         classWorkerURL: workerBlobURL,
     });
 
