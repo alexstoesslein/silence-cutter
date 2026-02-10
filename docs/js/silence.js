@@ -10,36 +10,41 @@ let ffmpegInstance = null;
 let ffmpegLoaded = false;
 
 /**
- * Load FFmpeg.wasm (one-time, ~30MB download from CDN).
- * All resources are converted to blob URLs so Workers run same-origin.
+ * Load FFmpeg.wasm (one-time download from CDN).
+ * All resources loaded in parallel as blob URLs to avoid cross-origin Worker issues.
+ * onProgress(percent, label) is called with download progress.
  */
 export async function loadFFmpeg(onProgress) {
     if (ffmpegLoaded && ffmpegInstance) return ffmpegInstance;
 
-    // Step 1: Fetch the worker chunk and create a blob URL for it
-    const workerChunkResp = await fetch(
-        "https://unpkg.com/@ffmpeg/ffmpeg@0.12.10/dist/umd/814.ffmpeg.js"
+    const coreBase = "https://unpkg.com/@ffmpeg/core@0.12.6/dist/umd";
+    const ffmpegBase = "https://unpkg.com/@ffmpeg/ffmpeg@0.12.10/dist/umd";
+
+    // Download ALL resources in parallel (the big speedup)
+    if (onProgress) onProgress(0, "Downloads starten...");
+
+    const [mainText, workerText, coreURL, wasmURL] = await Promise.all([
+        fetchAsText(`${ffmpegBase}/ffmpeg.js`),
+        fetchAsText(`${ffmpegBase}/814.ffmpeg.js`),
+        fetchAsBlobURL(`${coreBase}/ffmpeg-core.js`, "text/javascript", (p) => {
+            if (onProgress) onProgress(Math.round(p * 0.1), "ffmpeg-core.js");
+        }),
+        fetchAsBlobURL(`${coreBase}/ffmpeg-core.wasm`, "application/wasm", (p) => {
+            if (onProgress) onProgress(10 + Math.round(p * 0.8), "ffmpeg-core.wasm");
+        }),
+    ]);
+
+    if (onProgress) onProgress(90, "FFmpeg initialisieren...");
+
+    // Worker chunk as blob URL
+    const workerBlobURL = URL.createObjectURL(
+        new Blob([workerText], { type: "text/javascript" })
     );
-    const workerChunkText = await workerChunkResp.text();
-    const workerChunkBlob = new Blob([workerChunkText], { type: "text/javascript" });
-    const workerChunkBlobURL = URL.createObjectURL(workerChunkBlob);
 
-    // Step 2: Fetch the main ffmpeg.js UMD bundle and patch the chunk URL
-    const mainResp = await fetch(
-        "https://unpkg.com/@ffmpeg/ffmpeg@0.12.10/dist/umd/ffmpeg.js"
+    // Load main UMD bundle via script tag (sets globalThis.FFmpegWASM)
+    const mainBlobURL = URL.createObjectURL(
+        new Blob([mainText], { type: "text/javascript" })
     );
-    let mainText = await mainResp.text();
-
-    // The UMD bundle constructs worker URL via: new URL(e.p + e.u(814), e.b)
-    // where e.p is the public path and e.u(814) returns "814.ffmpeg.js"
-    // We need to patch it so the worker blob URL is used instead.
-    // We do this by injecting classWorkerURL at load time (see below).
-
-    // Load the UMD bundle
-    const mainBlob = new Blob([mainText], { type: "text/javascript" });
-    const mainBlobURL = URL.createObjectURL(mainBlob);
-
-    // Execute via script tag (UMD sets globalThis.FFmpegWASM)
     await new Promise((resolve, reject) => {
         const script = document.createElement("script");
         script.src = mainBlobURL;
@@ -49,39 +54,66 @@ export async function loadFFmpeg(onProgress) {
     });
 
     const { FFmpeg } = globalThis.FFmpegWASM;
-
     ffmpegInstance = new FFmpeg();
 
     ffmpegInstance.on("progress", ({ progress }) => {
-        if (onProgress) onProgress(Math.round(progress * 100));
+        if (onProgress) onProgress(95 + Math.round(progress * 5), "Verarbeitung...");
     });
-
-    // Step 3: Load core WASM files as blob URLs
-    const coreBase = "https://unpkg.com/@ffmpeg/core@0.12.6/dist/umd";
-
-    const [coreURL, wasmURL] = await Promise.all([
-        fetchAsBlobURL(`${coreBase}/ffmpeg-core.js`, "text/javascript"),
-        fetchAsBlobURL(`${coreBase}/ffmpeg-core.wasm`, "application/wasm"),
-    ]);
 
     await ffmpegInstance.load({
         coreURL,
         wasmURL,
-        classWorkerURL: workerChunkBlobURL,
+        classWorkerURL: workerBlobURL,
     });
 
+    if (onProgress) onProgress(100, "Bereit");
     ffmpegLoaded = true;
     return ffmpegInstance;
 }
 
 /**
- * Fetch a URL and return it as a blob URL (same-origin).
+ * Fetch URL as text.
  */
-async function fetchAsBlobURL(url, mimeType) {
+async function fetchAsText(url) {
     const resp = await fetch(url);
-    const buf = await resp.arrayBuffer();
-    const blob = new Blob([buf], { type: mimeType });
-    return URL.createObjectURL(blob);
+    return resp.text();
+}
+
+/**
+ * Fetch a URL and return it as a blob URL. Reports download progress.
+ */
+async function fetchAsBlobURL(url, mimeType, onProgress) {
+    const resp = await fetch(url);
+    const contentLength = parseInt(resp.headers.get("Content-Length") || "0");
+
+    if (!contentLength || !resp.body) {
+        // No streaming – simple fallback
+        const buf = await resp.arrayBuffer();
+        if (onProgress) onProgress(100);
+        return URL.createObjectURL(new Blob([buf], { type: mimeType }));
+    }
+
+    // Stream with progress
+    const reader = resp.body.getReader();
+    const chunks = [];
+    let received = 0;
+
+    while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        chunks.push(value);
+        received += value.length;
+        if (onProgress) onProgress(Math.round((received / contentLength) * 100));
+    }
+
+    const buf = new Uint8Array(received);
+    let offset = 0;
+    for (const chunk of chunks) {
+        buf.set(chunk, offset);
+        offset += chunk.length;
+    }
+
+    return URL.createObjectURL(new Blob([buf], { type: mimeType }));
 }
 
 /**

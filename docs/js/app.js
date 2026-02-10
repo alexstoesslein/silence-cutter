@@ -139,8 +139,11 @@ async function startPipeline(file) {
     try {
         // Step 1: Load FFmpeg.wasm
         setStep("loading_ffmpeg", 0, 0);
-        setProcessingStats("FFmpeg.wasm wird geladen (~30 MB)...");
-        await loadFFmpeg(pct => setProcessingStats(`FFmpeg.wasm: ${pct}%`));
+        setProcessingStats("FFmpeg.wasm wird geladen...");
+        await loadFFmpeg((pct, label) => {
+            setStep("loading_ffmpeg", pct, 100);
+            setProcessingStats(`${label || "Laden"}: ${pct}%`);
+        });
 
         // Write file to ffmpeg virtual FS
         setProcessingStats("Datei wird geladen...");
