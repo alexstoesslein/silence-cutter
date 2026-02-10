@@ -13,6 +13,10 @@ let ffmpegLoaded = false;
  * Load FFmpeg.wasm (one-time download from CDN).
  * All resources loaded in parallel as blob URLs to avoid cross-origin Worker issues.
  * onProgress(percent, label) is called with download progress.
+ *
+ * Strategy: Download all assets as blob URLs. The worker's importScripts() can load
+ * blob URLs (same blob: origin). We patch the worker source to replace the CDN core
+ * URL with our blob URL so importScripts succeeds.
  */
 export async function loadFFmpeg(onProgress) {
     if (ffmpegLoaded && ffmpegInstance) return ffmpegInstance;
@@ -22,38 +26,31 @@ export async function loadFFmpeg(onProgress) {
 
     if (onProgress) onProgress(0, "Downloads starten...");
 
-    // Download main lib, worker source, and core JS source in parallel.
-    // The WASM binary is NOT pre-fetched – ffmpeg-core.js loads it itself
-    // when given its original CDN URL context.
-    const [mainText, workerText, coreText] = await Promise.all([
+    // Download everything in parallel: main lib text, worker text, core JS blob, WASM blob
+    const [mainText, workerText, coreBlobURL, wasmBlobURL] = await Promise.all([
         fetchAsText(`${ffmpegBase}/ffmpeg.js`),
         fetchAsText(`${ffmpegBase}/814.ffmpeg.js`),
-        fetchAsText(`${coreBase}/ffmpeg-core.js`),
+        fetchAsBlobURL(`${coreBase}/ffmpeg-core.js`, "text/javascript"),
+        fetchAsBlobURL(`${coreBase}/ffmpeg-core.wasm`, "application/wasm"),
     ]);
 
     if (onProgress) onProgress(15, "FFmpeg initialisieren...");
 
-    // The core problem: the 814.ffmpeg.js worker tries importScripts(coreURL)
-    // which fails cross-origin in blob workers. We patch the worker source to
-    // replace importScripts with inline execution of the core code.
-    //
-    // The worker code does: try { importScripts(r) } catch { ... }
-    // After importScripts, self.createFFmpegCore is set by ffmpeg-core.js.
-    // We prepend the core code so createFFmpegCore already exists,
-    // and patch out the importScripts call.
-
-    // Patch worker: prepend core.js and make importScripts a no-op for the core URL
+    // The 814.ffmpeg.js worker receives the coreURL via a postMessage and calls
+    // importScripts(coreURL). On GitHub Pages, coreURL points to unpkg CDN which
+    // fails cross-origin from a blob: Worker. Fix: override importScripts to
+    // redirect CDN URLs to our same-origin blob URLs.
     const patchedWorkerCode = `
-// Pre-load ffmpeg-core.js inline (avoids cross-origin importScripts)
-${coreText}
-
-// Override importScripts so the worker doesn't try to load core again
-const _origImportScripts = self.importScripts;
+// Override importScripts to redirect cross-origin ffmpeg-core to blob URL
+const _origImportScripts = self.importScripts.bind(self);
 self.importScripts = function(...args) {
-    // Skip if trying to load ffmpeg-core (already loaded above)
-    const isCore = args.some(a => typeof a === 'string' && (a.includes('ffmpeg-core') || a.startsWith('blob:')));
-    if (isCore) return;
-    return _origImportScripts.apply(self, args);
+    const mapped = args.map(a => {
+        if (typeof a === 'string' && a.includes('ffmpeg-core') && !a.startsWith('blob:')) {
+            return ${JSON.stringify(coreBlobURL)};
+        }
+        return a;
+    });
+    return _origImportScripts(...mapped);
 };
 
 // Original worker code
@@ -85,12 +82,13 @@ ${workerText}
         if (onProgress) onProgress(30 + Math.round(progress * 70), "WASM laden...");
     });
 
-    // coreURL: real CDN URL (used by createFFmpegCore to derive wasmURL/workerURL)
-    // wasmURL: real CDN URL (fetched by emscripten module via HTTP)
+    // coreURL: our blob URL (the worker's patched importScripts will use it)
+    // wasmURL: blob URL (ffmpeg-core.js fetches WASM relative to its location,
+    //          but since it's a blob, we provide the explicit wasmURL)
     // classWorkerURL: our patched blob worker
     await ffmpegInstance.load({
-        coreURL: `${coreBase}/ffmpeg-core.js`,
-        wasmURL: `${coreBase}/ffmpeg-core.wasm`,
+        coreURL: coreBlobURL,
+        wasmURL: wasmBlobURL,
         classWorkerURL: workerBlobURL,
     });
 
