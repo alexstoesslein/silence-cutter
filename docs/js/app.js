@@ -87,7 +87,8 @@ function readSettings() {
 // ── API Key ──
 function initApiKey() {
     const input = document.getElementById("api-key-input");
-    const saved = getApiKey();
+    // Only show user-saved key, not the built-in default
+    const saved = localStorage.getItem("silence_cutter_api_key");
     if (saved) input.value = saved;
 
     input.addEventListener("change", () => setApiKey(input.value));
@@ -251,7 +252,8 @@ async function startPipeline(file) {
 
     } catch (err) {
         console.error("Pipeline error:", err);
-        showError(err.message || "Unbekannter Fehler");
+        const msg = err.stack || err.message || String(err);
+        showError(msg);
     }
 }
 
