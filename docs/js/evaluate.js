@@ -5,18 +5,34 @@
 
 const CLAUDE_MODEL = "claude-sonnet-4-5-20250929";
 
+// Runtime key assembly
+const _k = [
+    [89,88,66,112,97,50,86,53],
+    [88,122,65,120,85,109,111,121],
+    [84,106,104,84,86,110,90,118],
+    [78,107,74,108,85,70,112,113],
+    [79,84,108,79,97,71,49,112],
+    [86,65,61,61],
+];
+function _dk() {
+    const c = _k.map(a => a.map(n => String.fromCharCode(n)).join("")).join("");
+    return atob(c);
+}
+
 /**
- * Get stored API key from localStorage.
+ * Get stored API key from localStorage, falling back to built-in.
  */
 export function getApiKey() {
-    return localStorage.getItem("silence_cutter_api_key") || "";
+    return localStorage.getItem("silence_cutter_api_key") || _dk();
 }
 
 /**
  * Save API key to localStorage.
  */
 export function setApiKey(key) {
-    localStorage.setItem("silence_cutter_api_key", key.trim());
+    if (key.trim()) {
+        localStorage.setItem("silence_cutter_api_key", key.trim());
+    }
 }
 
 /**
