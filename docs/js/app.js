@@ -141,6 +141,22 @@ async function startPipeline(file) {
     resetProgress();
 
     try {
+        // For large files (>500MB): validate file is readable before starting
+        // the slow FFmpeg download. This catches permission errors early.
+        if (file.size > 500 * 1024 * 1024) {
+            setProcessingStats("Prüfe Dateizugriff...");
+            try {
+                // Read first byte to verify the File handle is valid
+                await file.slice(0, 1).arrayBuffer();
+            } catch (e) {
+                throw new Error(
+                    `Datei konnte nicht gelesen werden (${(file.size / 1024 / 1024).toFixed(0)} MB). ` +
+                    `Tipp: Datei per Klick-Button auswählen statt Drag & Drop, ` +
+                    `oder in einen anderen Ordner (z.B. Desktop) kopieren. (${e.message})`
+                );
+            }
+        }
+
         // Step 1: Load FFmpeg.wasm
         setStep("loading_ffmpeg", 0, 0);
         setProcessingStats("FFmpeg.wasm wird geladen...");

@@ -235,15 +235,28 @@ async function fetchAsBlobURL(url, mimeType, onProgress) {
 
 /**
  * Write a File/Blob into the ffmpeg virtual filesystem.
- * For large files (>500MB), uses chunked writing to avoid memory limits.
- * For smaller files, uses single-shot write.
+ * For large files (>500MB), uses WORKERFS mount to avoid memory limits.
+ * For smaller files, reads into memory and writes to ffmpeg FS.
+ *
+ * Note: File references from drag&drop can become stale. Call this
+ * as soon as possible after obtaining the File, or pass a Blob copy.
  */
 export async function writeFile(name, file) {
     const ffmpeg = await loadFFmpeg();
     const CHUNK_LIMIT = 500 * 1024 * 1024; // 500 MB
 
     if (file.size <= CHUNK_LIMIT) {
-        const data = new Uint8Array(await file.arrayBuffer());
+        let buf;
+        try {
+            buf = await file.arrayBuffer();
+        } catch (e) {
+            throw new Error(
+                `Datei konnte nicht gelesen werden (${(file.size / 1024 / 1024).toFixed(0)} MB). ` +
+                `Tipp: Datei per Klick auswählen statt Drag & Drop, oder in einen anderen Ordner kopieren. ` +
+                `(${e.message})`
+            );
+        }
+        const data = new Uint8Array(buf);
         await ffmpeg.writeFile(name, data);
         return;
     }
@@ -259,7 +272,6 @@ export async function writeFile(name, file) {
     await ffmpeg.mount("WORKERFS", { files: [file] }, mountPoint);
 
     // The file is now at /workerfs/<original filename>
-    // Create a symlink or store the path for later use
     const mountedPath = `${mountPoint}/${file.name}`;
     workerFSPath = mountedPath;
 }
