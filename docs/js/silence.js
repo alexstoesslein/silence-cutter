@@ -170,8 +170,12 @@ self.onmessage = async function({ data: { id, type, data } }) {
     const { FFmpeg } = globalThis.FFmpegWASM;
     ffmpegInstance = new FFmpeg();
 
-    ffmpegInstance.on("progress", ({ progress }) => {
-        if (onProgress) onProgress(30 + Math.round(progress * 70), "WASM laden...");
+    ffmpegInstance.on("progress", (evt) => {
+        // progress can be { progress: 0-1 } or { ratio: 0-1 } or { progress: huge_number, time: ... }
+        let pct = evt.progress ?? evt.ratio ?? 0;
+        // If progress value is > 1, it's likely time in us — ignore for load progress
+        if (pct > 1) pct = 0;
+        if (onProgress) onProgress(30 + Math.round(pct * 70), "WASM laden...");
     });
 
     // coreURL: CDN URL (used by createFFmpegCore internally to derive paths)
@@ -386,10 +390,13 @@ export async function extractSegmentWav(inputName, segment) {
     const ffmpeg = await loadFFmpeg();
     const outName = `seg_${segment.index}.wav`;
 
+    // -ss before -i = input seeking (fast, doesn't decode from start)
+    // -t = duration (more reliable than -to after input seek)
+    const duration = segment.end - segment.start;
     await ffmpeg.exec([
-        "-i", inputName,
         "-ss", String(segment.start),
-        "-to", String(segment.end),
+        "-i", inputName,
+        "-t", String(duration),
         "-vn",
         "-acodec", "pcm_s16le",
         "-ar", "16000",
@@ -412,11 +419,13 @@ export async function computeAudioMetrics(inputName, segment) {
     const logHandler = ({ message }) => { logBuffer += message + "\n"; };
     ffmpeg.on("log", logHandler);
 
+    const duration = segment.end - segment.start;
     try {
+        // -ss before -i for fast input seeking on large files
         await ffmpeg.exec([
-            "-i", inputName,
             "-ss", String(segment.start),
-            "-to", String(segment.end),
+            "-i", inputName,
+            "-t", String(duration),
             "-af", "volumedetect",
             "-f", "null", "-"
         ]);
