@@ -48,20 +48,28 @@ export async function loadWhisperModel(modelName = "Xenova/whisper-small", onPro
 
 /**
  * Transcribe a WAV Blob.
+ * @param {Blob} wavBlob
+ * @param {string} modelName
+ * @param {string|null} language - ISO 639-1 code (e.g. "de", "en") or null for auto-detect
  * Returns { text, chunks: [{ text, timestamp: [start, end] }] }
  */
-export async function transcribeBlob(wavBlob, modelName) {
+export async function transcribeBlob(wavBlob, modelName, language = null) {
     const asr = await loadWhisperModel(modelName);
 
     // Convert Blob → Float32Array of audio samples
     const arrayBuffer = await wavBlob.arrayBuffer();
     const audioData = convertWavToFloat32(arrayBuffer);
 
-    const result = await asr(audioData, {
+    const opts = {
         return_timestamps: true,
         chunk_length_s: 30,
         stride_length_s: 5,
-    });
+    };
+    if (language) {
+        opts.language = language;
+    }
+
+    const result = await asr(audioData, opts);
 
     return {
         text: result.text?.trim() || "",
@@ -71,8 +79,9 @@ export async function transcribeBlob(wavBlob, modelName) {
 
 /**
  * Transcribe all segments. Adds 'transcription' to each segment.
+ * @param {string|null} language - ISO 639-1 code or null for auto-detect
  */
-export async function transcribeAllSegments(segments, wavBlobs, modelName, onProgress) {
+export async function transcribeAllSegments(segments, wavBlobs, modelName, language, onProgress) {
     const total = segments.length;
     for (let i = 0; i < total; i++) {
         const blob = wavBlobs[i];
@@ -82,7 +91,7 @@ export async function transcribeAllSegments(segments, wavBlobs, modelName, onPro
         }
 
         try {
-            const result = await transcribeBlob(blob, modelName);
+            const result = await transcribeBlob(blob, modelName, language);
             segments[i].transcription = result;
         } catch (e) {
             console.error(`Transcription failed for segment ${i}:`, e);

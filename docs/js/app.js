@@ -3,7 +3,7 @@
  * Orchestrates the full client-side pipeline.
  */
 
-import { loadFFmpeg, writeFile, detectSilence, extractSegmentWav, computeAudioMetrics } from "./silence.js";
+import { loadFFmpeg, writeFile, getInputPath, detectSilence, extractSegmentWav, computeAudioMetrics } from "./silence.js";
 import { loadWhisperModel, transcribeAllSegments, groupSimilarTakes } from "./transcribe.js";
 import { getApiKey, setApiKey, evaluateTakes, applyEvaluation } from "./evaluate.js";
 import { generateFCPXML, generateEDL, generateReport, downloadString } from "./export.js";
@@ -79,6 +79,7 @@ function readSettings() {
         minSilence: parseFloat(document.getElementById("min-silence").value),
         minSpeech: parseFloat(document.getElementById("min-speech").value),
         whisperModel: document.getElementById("whisper-model").value,
+        whisperLanguage: document.getElementById("whisper-language").value,
         similarityThreshold: parseFloat(document.getElementById("similarity-threshold").value),
         fps: parseInt(document.getElementById("fps").value),
     };
@@ -103,6 +104,8 @@ function initButtons() {
     document.getElementById("btn-new").addEventListener("click", () => {
         state = { file: null, filename: "", segments: [], wavBlobs: [], groups: [], bestTakes: [], totalDuration: 0, finalDuration: 0, suggestedOrder: [], overallNotes: "", settings: {} };
         document.getElementById("file-input").value = "";
+        // Reset large file WORKERFS path
+        import("./silence.js").then(m => { if (m.resetWorkerFS) m.resetWorkerFS(); });
         showScreen("upload");
     });
     document.getElementById("btn-retry").addEventListener("click", () => showScreen("upload"));
@@ -146,15 +149,16 @@ async function startPipeline(file) {
             setProcessingStats(`${label || "Laden"}: ${pct}%`);
         });
 
-        // Write file to ffmpeg virtual FS
+        // Write file to ffmpeg virtual FS (large files use WORKERFS mount)
         setProcessingStats("Datei wird geladen...");
         await writeFile("input", file);
+        const inputPath = getInputPath("input");
 
         // Step 2: Silence Detection
         setStep("silence_detection", 0, 0);
         setProcessingStats("Analysiere Audio...");
         const detection = await detectSilence(
-            "input",
+            inputPath,
             state.settings.noiseThreshold,
             state.settings.minSilence,
             state.settings.minSpeech,
@@ -173,11 +177,11 @@ async function startPipeline(file) {
         setStep("segment_extraction", 0, state.segments.length);
         state.wavBlobs = [];
         for (let i = 0; i < state.segments.length; i++) {
-            const blob = await extractSegmentWav("input", state.segments[i]);
+            const blob = await extractSegmentWav(inputPath, state.segments[i]);
             state.wavBlobs.push(blob);
 
             // Audio metrics
-            const metrics = await computeAudioMetrics("input", state.segments[i]);
+            const metrics = await computeAudioMetrics(inputPath, state.segments[i]);
             state.segments[i].audio_metrics = metrics;
 
             setStep("segment_extraction", i + 1, state.segments.length);
@@ -199,10 +203,12 @@ async function startPipeline(file) {
 
         // Step 5: Transcription
         setStep("transcription", 0, state.segments.length);
+        const whisperLang = state.settings.whisperLanguage === "auto" ? null : state.settings.whisperLanguage;
         await transcribeAllSegments(
             state.segments,
             state.wavBlobs,
             modelId,
+            whisperLang,
             (done, total) => {
                 setStep("transcription", done, total);
                 setProcessingStats(`Transkription: ${done}/${total} Segmente`);

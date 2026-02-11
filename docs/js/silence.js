@@ -37,54 +37,53 @@ export async function loadFFmpeg(onProgress) {
 
     // Build a custom worker that replaces 814.ffmpeg.js entirely.
     // It implements the same message protocol (LOAD, EXEC, WRITE_FILE, etc.)
-    // but loads ffmpeg-core.js via inline eval() instead of importScripts().
-    const customWorkerCode = `
-// === ffmpeg-core.js will be loaded via eval() during LOAD ===
-let ffmpegCore = null;
-let coreJsText = null;
+    // ffmpeg-core.js is embedded directly as executable code at the top of the
+    // worker (not as a string, not via eval, not via importScripts).
+    // This sets `var createFFmpegCore` in the Worker's global scope.
+    //
+    // The worker code that follows uses self.createFFmpegCore which is the same
+    // as the top-level var in a Worker (Worker global scope = self).
 
-self.onmessage = async ({ data: { id, type, data } }) => {
-    const transferables = [];
-    let result;
+    const workerWithCore = `
+// ============================================================
+// Part 1: ffmpeg-core.js (UMD) — sets var createFFmpegCore
+// ============================================================
+${coreText}
+
+// ============================================================
+// Part 2: Custom worker message handler
+// ============================================================
+var ffmpegCore = null;
+
+self.onmessage = async function({ data: { id, type, data } }) {
+    var transferables = [];
+    var result;
     try {
         if (type !== "LOAD" && !ffmpegCore) {
             throw new Error("ffmpeg is not loaded, call ffmpeg.load() first");
         }
         switch (type) {
             case "LOAD": {
-                const isFirst = !ffmpegCore;
-                const { coreURL, wasmURL, workerURL } = data;
+                var isFirst = !ffmpegCore;
+                var coreURL = data.coreURL || "https://unpkg.com/@ffmpeg/core@0.12.6/dist/umd/ffmpeg-core.js";
+                var wasmURL = data.wasmURL || coreURL.replace(/.js$/g, ".wasm");
+                var workerURL = data.workerURL || coreURL.replace(/.js$/g, ".worker.js");
 
-                // Load ffmpeg-core.js via eval (already embedded as text)
-                if (!self.createFFmpegCore) {
-                    // The core text is injected as a string literal below
-                    (0, eval)(coreJsText);
-                    // After eval, createFFmpegCore should be a global var
-                    if (typeof createFFmpegCore === 'undefined') {
-                        throw new Error("eval of ffmpeg-core.js did not define createFFmpegCore");
-                    }
-                    self.createFFmpegCore = createFFmpegCore;
-                }
-
-                const actualCoreURL = coreURL || "https://unpkg.com/@ffmpeg/core@0.12.6/dist/umd/ffmpeg-core.js";
-                const actualWasmURL = wasmURL || actualCoreURL.replace(/.js$/g, ".wasm");
-                const actualWorkerURL = workerURL || actualCoreURL.replace(/.js$/g, ".worker.js");
-
-                ffmpegCore = await self.createFFmpegCore({
-                    mainScriptUrlOrBlob: actualCoreURL + "#" + btoa(JSON.stringify({
-                        wasmURL: actualWasmURL,
-                        workerURL: actualWorkerURL
+                ffmpegCore = await createFFmpegCore({
+                    mainScriptUrlOrBlob: coreURL + "#" + btoa(JSON.stringify({
+                        wasmURL: wasmURL,
+                        workerURL: workerURL
                     }))
                 });
-                ffmpegCore.setLogger((msg) => self.postMessage({ type: "LOG", data: msg }));
-                ffmpegCore.setProgress((p) => self.postMessage({ type: "PROGRESS", data: p }));
+                ffmpegCore.setLogger(function(msg) { self.postMessage({ type: "LOG", data: msg }); });
+                ffmpegCore.setProgress(function(p) { self.postMessage({ type: "PROGRESS", data: p }); });
                 result = isFirst;
                 break;
             }
             case "EXEC": {
-                const { args, timeout = -1 } = data;
+                var timeout = (data.timeout != null) ? data.timeout : -1;
                 ffmpegCore.setTimeout(timeout);
-                ffmpegCore.exec(...args);
+                ffmpegCore.exec.apply(ffmpegCore, data.args);
                 result = ffmpegCore.ret;
                 ffmpegCore.reset();
                 break;
@@ -114,11 +113,11 @@ self.onmessage = async ({ data: { id, type, data } }) => {
                 break;
             }
             case "LIST_DIR": {
-                const entries = ffmpegCore.FS.readdir(data.path);
+                var entries = ffmpegCore.FS.readdir(data.path);
                 result = [];
-                for (const name of entries) {
-                    const stat = ffmpegCore.FS.stat(data.path + "/" + name);
-                    result.push({ name, isDir: ffmpegCore.FS.isDir(stat.mode) });
+                for (var i = 0; i < entries.length; i++) {
+                    var stat = ffmpegCore.FS.stat(data.path + "/" + entries[i]);
+                    result.push({ name: entries[i], isDir: ffmpegCore.FS.isDir(stat.mode) });
                 }
                 break;
             }
@@ -128,7 +127,7 @@ self.onmessage = async ({ data: { id, type, data } }) => {
                 break;
             }
             case "MOUNT": {
-                const fs = ffmpegCore.FS.filesystems[data.fsType];
+                var fs = ffmpegCore.FS.filesystems[data.fsType];
                 if (fs) { ffmpegCore.FS.mount(fs, data.options, data.mountPoint); result = true; }
                 else { result = false; }
                 break;
@@ -142,20 +141,13 @@ self.onmessage = async ({ data: { id, type, data } }) => {
                 throw new Error("unknown message type");
         }
     } catch (e) {
-        self.postMessage({ id, type: "ERROR", data: e.toString() });
+        self.postMessage({ id: id, type: "ERROR", data: e.toString() });
         return;
     }
     if (result instanceof Uint8Array) transferables.push(result.buffer);
-    self.postMessage({ id, type, data: result }, transferables);
+    self.postMessage({ id: id, type: type, data: result }, transferables);
 };
 `;
-
-    // Inject the core JS text as a string literal into the worker
-    // We use JSON.stringify to safely escape the entire source code
-    const workerWithCore = customWorkerCode.replace(
-        'let coreJsText = null;',
-        'let coreJsText = ' + JSON.stringify(coreText) + ';'
-    );
 
     const workerBlobURL = URL.createObjectURL(
         new Blob([workerWithCore], { type: "text/javascript" })
@@ -243,11 +235,51 @@ async function fetchAsBlobURL(url, mimeType, onProgress) {
 
 /**
  * Write a File/Blob into the ffmpeg virtual filesystem.
+ * For large files (>500MB), uses chunked writing to avoid memory limits.
+ * For smaller files, uses single-shot write.
  */
 export async function writeFile(name, file) {
     const ffmpeg = await loadFFmpeg();
-    const data = new Uint8Array(await file.arrayBuffer());
-    await ffmpeg.writeFile(name, data);
+    const CHUNK_LIMIT = 500 * 1024 * 1024; // 500 MB
+
+    if (file.size <= CHUNK_LIMIT) {
+        const data = new Uint8Array(await file.arrayBuffer());
+        await ffmpeg.writeFile(name, data);
+        return;
+    }
+
+    // Large file: mount via WORKERFS so ffmpeg reads directly from the Blob
+    // This avoids loading the entire file into WASM memory at once.
+    const mountPoint = "/workerfs";
+    try {
+        await ffmpeg.createDir(mountPoint);
+    } catch (_) {
+        // Directory may already exist
+    }
+    await ffmpeg.mount("WORKERFS", { files: [file] }, mountPoint);
+
+    // The file is now at /workerfs/<original filename>
+    // Create a symlink or store the path for later use
+    const mountedPath = `${mountPoint}/${file.name}`;
+    workerFSPath = mountedPath;
+}
+
+// Track if we're using WORKERFS (large file mode)
+let workerFSPath = null;
+
+/**
+ * Get the actual input path for ffmpeg commands.
+ * Returns the WORKERFS path for large files, or the given name for small files.
+ */
+export function getInputPath(name) {
+    return workerFSPath || name;
+}
+
+/**
+ * Reset WORKERFS state for a new file.
+ */
+export function resetWorkerFS() {
+    workerFSPath = null;
 }
 
 /**
