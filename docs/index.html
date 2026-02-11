@@ -144,7 +144,7 @@
                     </div>
                     <div class="step" data-step="export">
                         <span class="step-icon">8</span>
-                        <span class="step-label">Export generieren</span>
+                        <span class="step-label">Export &amp; Rendering</span>
                         <span class="step-status"></span>
                     </div>
                 </div>
@@ -160,6 +160,19 @@
             <div class="results-header">
                 <h2>Ergebnis</h2>
                 <div class="results-summary" id="results-summary"></div>
+            </div>
+
+            <!-- Preview Player -->
+            <div class="preview-section" id="preview-section" style="display:none">
+                <h3>Vorschau</h3>
+                <div class="preview-player-wrap">
+                    <video id="preview-video" controls style="display:none"></video>
+                    <audio id="preview-audio" controls style="display:none"></audio>
+                </div>
+                <div class="preview-actions">
+                    <button class="btn btn-primary" id="btn-download-cut">Geschnittenes Video herunterladen</button>
+                    <button class="btn btn-ghost" id="btn-rerender">Neu rendern</button>
+                </div>
             </div>
 
             <div class="export-bar" id="export-bar">

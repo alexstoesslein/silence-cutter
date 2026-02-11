@@ -437,6 +437,102 @@ export async function computeAudioMetrics(inputName, segment) {
     return metrics;
 }
 
+/**
+ * Render the cut file: concatenate the best takes into a single output file.
+ * Uses ffmpeg concat filter to join segments from the source.
+ * Returns a Blob of the rendered file.
+ *
+ * @param {string} inputName - path in ffmpeg FS (or WORKERFS path)
+ * @param {Array} bestTakes - array of { start, end, duration, index }
+ * @param {string} sourceFilename - original filename (for format detection)
+ * @param {function} onProgress - callback(percent, label)
+ * @returns {Promise<Blob>}
+ */
+export async function renderCutFile(inputName, bestTakes, sourceFilename, onProgress) {
+    const ffmpeg = await loadFFmpeg();
+
+    if (!bestTakes || bestTakes.length === 0) {
+        throw new Error("Keine Takes zum Rendern vorhanden.");
+    }
+
+    const isVideo = /\.(mp4|mov|mkv|webm)$/i.test(sourceFilename);
+    const outExt = isVideo ? "mp4" : "mp3";
+    const outName = `output.${outExt}`;
+
+    if (onProgress) onProgress(0, "Concat-Filter vorbereiten...");
+
+    // Build concat filter: extract each segment and concatenate
+    // Using the concat demuxer approach via a file list is simplest,
+    // but ffmpeg.wasm doesn't support concat demuxer well.
+    // Instead, use complex filtergraph with trim + concat filters.
+
+    const filterParts = [];
+    const inputStreams = [];
+
+    for (let i = 0; i < bestTakes.length; i++) {
+        const take = bestTakes[i];
+        if (isVideo) {
+            filterParts.push(
+                `[0:v]trim=start=${take.start}:end=${take.end},setpts=PTS-STARTPTS[v${i}];` +
+                `[0:a]atrim=start=${take.start}:end=${take.end},asetpts=PTS-STARTPTS[a${i}]`
+            );
+            inputStreams.push(`[v${i}][a${i}]`);
+        } else {
+            filterParts.push(
+                `[0:a]atrim=start=${take.start}:end=${take.end},asetpts=PTS-STARTPTS[a${i}]`
+            );
+            inputStreams.push(`[a${i}]`);
+        }
+    }
+
+    const concatN = bestTakes.length;
+    const concatV = isVideo ? 1 : 0;
+    const concatA = 1;
+
+    const filterComplex =
+        filterParts.join(";") + ";" +
+        inputStreams.join("") + `concat=n=${concatN}:v=${concatV}:a=${concatA}` +
+        (isVideo ? "[outv][outa]" : "[outa]");
+
+    const args = ["-i", inputName, "-filter_complex", filterComplex];
+
+    if (isVideo) {
+        args.push("-map", "[outv]", "-map", "[outa]");
+        args.push("-c:v", "libx264", "-preset", "ultrafast", "-crf", "23");
+        args.push("-c:a", "aac", "-b:a", "128k");
+    } else {
+        args.push("-map", "[outa]");
+        args.push("-c:a", "libmp3lame", "-b:a", "192k");
+    }
+
+    args.push("-y", outName);
+
+    // Track progress via ffmpeg progress events
+    let progressHandler;
+    if (onProgress) {
+        progressHandler = ({ progress }) => {
+            const pct = Math.min(Math.round(progress * 100), 99);
+            onProgress(pct, "Rendering...");
+        };
+        ffmpeg.on("progress", progressHandler);
+    }
+
+    try {
+        await ffmpeg.exec(args);
+    } finally {
+        if (progressHandler) ffmpeg.off("progress", progressHandler);
+    }
+
+    if (onProgress) onProgress(100, "Fertig");
+
+    // Read the output file
+    const data = await ffmpeg.readFile(outName);
+    try { await ffmpeg.deleteFile(outName); } catch (_) {}
+
+    const mimeType = isVideo ? "video/mp4" : "audio/mpeg";
+    return new Blob([data.buffer], { type: mimeType });
+}
+
 function round3(n) {
     return Math.round(n * 1000) / 1000;
 }

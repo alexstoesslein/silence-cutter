@@ -3,7 +3,7 @@
  * Orchestrates the full client-side pipeline.
  */
 
-import { loadFFmpeg, writeFile, getInputPath, detectSilence, extractSegmentWav, computeAudioMetrics } from "./silence.js";
+import { loadFFmpeg, writeFile, getInputPath, detectSilence, extractSegmentWav, computeAudioMetrics, renderCutFile } from "./silence.js";
 import { loadWhisperModel, transcribeAllSegments, groupSimilarTakes } from "./transcribe.js";
 import { getApiKey, setApiKey, evaluateTakes, applyEvaluation } from "./evaluate.js";
 import { generateFCPXML, generateEDL, generateReport, downloadString } from "./export.js";
@@ -26,6 +26,9 @@ let state = {
     suggestedOrder: [],
     overallNotes: "",
     settings: {},
+    cutBlob: null,
+    cutBlobURL: null,
+    inputPath: null,
 };
 
 // ── Init ──
@@ -101,9 +104,14 @@ function initButtons() {
     document.getElementById("btn-download-xml").addEventListener("click", downloadXML);
     document.getElementById("btn-download-edl").addEventListener("click", downloadEDL);
     document.getElementById("btn-download-json").addEventListener("click", downloadJSON);
+    document.getElementById("btn-download-cut").addEventListener("click", downloadCutFile);
+    document.getElementById("btn-rerender").addEventListener("click", rerenderCutFile);
     document.getElementById("btn-new").addEventListener("click", () => {
-        state = { file: null, filename: "", segments: [], wavBlobs: [], groups: [], bestTakes: [], totalDuration: 0, finalDuration: 0, suggestedOrder: [], overallNotes: "", settings: {} };
+        // Revoke old blob URL
+        if (state.cutBlobURL) URL.revokeObjectURL(state.cutBlobURL);
+        state = { file: null, filename: "", segments: [], wavBlobs: [], groups: [], bestTakes: [], totalDuration: 0, finalDuration: 0, suggestedOrder: [], overallNotes: "", settings: {}, cutBlob: null, cutBlobURL: null, inputPath: null };
         document.getElementById("file-input").value = "";
+        document.getElementById("preview-section").style.display = "none";
         // Reset large file WORKERFS path
         import("./silence.js").then(m => { if (m.resetWorkerFS) m.resetWorkerFS(); });
         showScreen("upload");
@@ -251,16 +259,17 @@ async function startPipeline(file) {
         // Calculate final duration
         state.finalDuration = state.bestTakes.reduce((sum, t) => sum + t.duration, 0);
 
-        // Step 8: Export ready
+        // Step 8: Render cut file
         setStep("export", 0, 0);
-        setProcessingStats("Fertig!");
+        setProcessingStats("Geschnittene Datei wird gerendert...");
+        state.inputPath = inputPath;
 
         completeAllSteps();
 
         // Build timeline data for UI
         const timeline = buildTimeline(state.bestTakes);
 
-        // Show results
+        // Show results first, then render in background
         renderResults({
             groups: state.groups,
             timeline,
@@ -271,6 +280,9 @@ async function startPipeline(file) {
             onSelectTake: handleSelectTake,
         });
         showScreen("results");
+
+        // Render the cut file in background (after results are shown)
+        doRenderCutFile().catch(e => console.error("Background render error:", e));
 
     } catch (err) {
         console.error("Pipeline error:", err);
@@ -322,6 +334,93 @@ function handleSelectTake(groupId, segIndex) {
     updateGroupSelection(groupId, segIndex);
     renderTimeline(buildTimeline(state.bestTakes));
     updateSummaryDuration(state.finalDuration, state.totalDuration);
+}
+
+// ── Cut File Download & Rerender ──
+function downloadCutFile() {
+    if (!state.cutBlob) return;
+    const isVideo = /\.(mp4|mov|mkv|webm)$/i.test(state.filename);
+    const ext = isVideo ? "mp4" : "mp3";
+    const base = state.filename.replace(/\.[^.]+$/, "");
+    const url = URL.createObjectURL(state.cutBlob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `${base}_cut.${ext}`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+}
+
+async function rerenderCutFile() {
+    if (!state.bestTakes.length || !state.inputPath) return;
+    await doRenderCutFile();
+}
+
+async function doRenderCutFile() {
+    const previewSection = document.getElementById("preview-section");
+    const videoEl = document.getElementById("preview-video");
+    const audioEl = document.getElementById("preview-audio");
+    const isVideo = /\.(mp4|mov|mkv|webm)$/i.test(state.filename);
+
+    // Show rendering progress
+    previewSection.style.display = "block";
+    videoEl.style.display = "none";
+    audioEl.style.display = "none";
+
+    // Add or update rendering indicator
+    let renderInfo = previewSection.querySelector(".preview-rendering");
+    if (!renderInfo) {
+        renderInfo = document.createElement("div");
+        renderInfo.className = "preview-rendering";
+        renderInfo.innerHTML = '<div class="render-label">Rendering...</div><div class="render-progress"><div class="render-progress-bar"></div></div>';
+        previewSection.querySelector(".preview-player-wrap").before(renderInfo);
+    }
+    renderInfo.style.display = "block";
+    const progressBar = renderInfo.querySelector(".render-progress-bar");
+    const renderLabel = renderInfo.querySelector(".render-label");
+
+    try {
+        // Revoke old URL
+        if (state.cutBlobURL) {
+            URL.revokeObjectURL(state.cutBlobURL);
+            state.cutBlobURL = null;
+        }
+
+        state.cutBlob = await renderCutFile(
+            state.inputPath,
+            state.bestTakes,
+            state.filename,
+            (pct, label) => {
+                progressBar.style.width = pct + "%";
+                renderLabel.textContent = `${label || "Rendering"} ${pct}%`;
+            }
+        );
+
+        state.cutBlobURL = URL.createObjectURL(state.cutBlob);
+
+        // Show the right player
+        renderInfo.style.display = "none";
+        if (isVideo) {
+            videoEl.src = state.cutBlobURL;
+            videoEl.style.display = "block";
+            audioEl.style.display = "none";
+        } else {
+            audioEl.src = state.cutBlobURL;
+            audioEl.style.display = "block";
+            videoEl.style.display = "none";
+        }
+
+        // Update download button text
+        const dlBtn = document.getElementById("btn-download-cut");
+        dlBtn.textContent = isVideo ? "Geschnittenes Video herunterladen" : "Geschnittenes Audio herunterladen";
+
+    } catch (e) {
+        console.error("Render error:", e);
+        renderInfo.style.display = "block";
+        renderLabel.textContent = "Render-Fehler: " + (e.message || String(e));
+        progressBar.style.width = "0%";
+    }
 }
 
 // ── Helpers ──
